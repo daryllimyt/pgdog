@@ -332,11 +332,47 @@ mod test {
         let key = Key::new("user", "db", "token");
         insert_expired(&cache, &key, true).await;
 
+        // The expired entry is replaced by a fresh, unvalidated one.
         let entry = cache.insert(&key, ServerAuth::Password);
-        entry.validation.get_or_init(|| async { false }).await;
+        assert!(!entry.expired());
+        assert!(entry.validation.get().is_none());
 
+        let mut validations = 0;
+        entry
+            .validation
+            .get_or_init(|| async {
+                validations += 1;
+                false
+            })
+            .await;
+
+        assert_eq!(validations, 1);
+        assert_eq!(entry.validation.get(), Some(&false));
         assert!(!entry.valid());
         assert!(!cache.get_and_check(&key));
+    }
+
+    #[tokio::test]
+    async fn test_token_cache_concurrent_callers_share_replacement() {
+        let cache = AuthTokenCache::default();
+        let key = Key::new("user", "db", "token");
+        insert_expired(&cache, &key, true).await;
+        let expired = cache.inner.lock().keys.get(&key).cloned().unwrap();
+
+        let barrier = std::sync::Barrier::new(2);
+        let (a, b) = std::thread::scope(|s| {
+            let insert = || {
+                barrier.wait();
+                cache.insert(&key, ServerAuth::Password)
+            };
+            let a = s.spawn(insert);
+            let b = s.spawn(insert);
+            (a.join().unwrap(), b.join().unwrap())
+        });
+
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(!Arc::ptr_eq(&a, &expired));
+        assert!(a.validation.get().is_none());
     }
 
     #[tokio::test]
