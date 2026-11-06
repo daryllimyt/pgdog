@@ -194,18 +194,23 @@ impl AuthTokenCache {
         let expires_at = expires_at(server_auth);
         let mut guard = self.inner.lock();
 
-        // Clients should not be sending the same token
-        // that's expired but we can't trust them.
-        let exists = guard.keys.get(key);
-
-        if let Some(exists) = exists {
-            exists.clone()
-        } else {
-            let value = Arc::new(Entry::new(expires_at));
-            guard.keys.insert(key.clone(), value.clone());
-            guard.keys_ord.push_back(key.clone());
-
-            value
+        match guard.keys.get(key) {
+            Some(entry) if !entry.expired() => entry.clone(),
+            // Clients can keep sending a token after its cache entry
+            // expires (e.g., Azure tokens outlive the cache lifetime).
+            // Replace the entry so the token is validated again.
+            Some(_) => {
+                let value = Arc::new(Entry::new(expires_at));
+                // Key is already in keys_ord.
+                guard.keys.insert(key.clone(), value.clone());
+                value
+            }
+            None => {
+                let value = Arc::new(Entry::new(expires_at));
+                guard.keys.insert(key.clone(), value.clone());
+                guard.keys_ord.push_back(key.clone());
+                value
+            }
         }
     }
 
@@ -285,5 +290,70 @@ mod test {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Backend(_)));
+    }
+
+    /// Store an entry that has already expired, with the given validation result.
+    async fn insert_expired(cache: &AuthTokenCache, key: &Key, valid: bool) {
+        let entry = Arc::new(Entry::new(SystemTime::now() - Duration::from_secs(1)));
+        entry.validation.get_or_init(|| async { valid }).await;
+
+        let mut guard = cache.inner.lock();
+        guard.keys.insert(key.clone(), entry);
+        guard.keys_ord.push_back(key.clone());
+    }
+
+    #[tokio::test]
+    async fn test_token_cache_expired_valid_entry_is_revalidated() {
+        let cache = AuthTokenCache::default();
+        let key = Key::new("user", "db", "token");
+        insert_expired(&cache, &key, true).await;
+        assert!(!cache.get_and_check(&key));
+
+        let entry = cache.insert(&key, ServerAuth::Password);
+        assert!(entry.validation.get().is_none());
+
+        let mut validations = 0;
+        entry
+            .validation
+            .get_or_init(|| async {
+                validations += 1;
+                true
+            })
+            .await;
+
+        assert_eq!(validations, 1);
+        assert!(entry.valid());
+        assert!(cache.get_and_check(&key));
+    }
+
+    #[tokio::test]
+    async fn test_token_cache_expired_entry_failed_recheck_is_rejected() {
+        let cache = AuthTokenCache::default();
+        let key = Key::new("user", "db", "token");
+        insert_expired(&cache, &key, true).await;
+
+        let entry = cache.insert(&key, ServerAuth::Password);
+        entry.validation.get_or_init(|| async { false }).await;
+
+        assert!(!entry.valid());
+        assert!(!cache.get_and_check(&key));
+    }
+
+    #[tokio::test]
+    async fn test_token_cache_replace_does_not_grow_keys_ord() {
+        let cache = AuthTokenCache::default();
+        let key = Key::new("user", "db", "token");
+        insert_expired(&cache, &key, true).await;
+
+        let replaced = cache.insert(&key, ServerAuth::Password);
+        assert_eq!(cache.inner.lock().keys_ord.len(), 1);
+
+        // A live entry is returned as-is.
+        let live = cache.insert(&key, ServerAuth::Password);
+        assert!(Arc::ptr_eq(&replaced, &live));
+
+        let guard = cache.inner.lock();
+        assert_eq!(guard.keys.len(), 1);
+        assert_eq!(guard.keys_ord.len(), 1);
     }
 }
